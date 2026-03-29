@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      - name: Checkout Your Repository
+        uses: actions/checkout@v4
+
       - name: Maximize Build Environment Storage
         uses: easimon/maximize-build-space@master
         with:
@@ -17,14 +20,15 @@ jobs:
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
+          remove-codeql: 'true'
 
-      - name: Checkout Your Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Build Environment
+      - name: Setup Build Environment (Aggressive Cache Cleanup)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev curl git zip unzip cpio gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get clean
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev curl git zip unzip cpio gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 
       - name: Download Clang Toolchain (r383902b)
         run: |
@@ -37,6 +41,9 @@ jobs:
       - name: Clone OnePlus Kernel Source
         run: |
           git clone --depth=1 -b oneplus/sm8350_u_14.0.0_oneplus9 https://github.com/OnePlusOSS/android_kernel_oneplus_sm8350.git kernel_workspace
+          
+          # Force the exact scmversion to match the stock kernel and prevent + dirty suffix
+          echo "-gd2a1055adeb0" > kernel_workspace/.scmversion
 
       - name: Clone and Integrate Vendor Modules & Devicetree
         run: |
@@ -67,15 +74,39 @@ jobs:
 
           mkdir -p out
           
+          # Disable LOCALVERSION_AUTO to prevent unexpected tag additions to the kernel release string
+          sed -i 's/CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' arch/arm64/configs/vendor/lahaina-qgki_defconfig
+          
           make O=out LLVM=1 -j$(nproc) vendor/lahaina-qgki_defconfig
+          
+          # Confirm .config is populated exactly as expected
+          grep "CONFIG_LOCALVERSION=" out/.config
+          
           make O=out LLVM=1 -j$(nproc)
+          
+      - name: Integrate AnyKernel3
+        run: |
+          echo "Cloning AnyKernel3..."
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git $GITHUB_WORKSPACE/AnyKernel3
+          cd $GITHUB_WORKSPACE/AnyKernel3
+          
+          # Remove unnecessary scripts to keep it clean, prepare for custom injection
+          rm -rf modules patch ramdisk README.md
+          
+          echo "Copying compiled Image to AnyKernel3 directory..."
+          cp $GITHUB_WORKSPACE/kernel_workspace/out/arch/arm64/boot/Image ./Image
+          
+          echo "Copying compiled OnePlus 9 Pro DTBs (if any)..."
+          mkdir -p dtbs
+          find $GITHUB_WORKSPACE/kernel_workspace/out/arch/arm64/boot/dts/vendor/qcom -name "*lemonad*.dtb*" -exec cp {} ./dtbs/ \; 2>/dev/null || true
+          
+          echo "Creating AnyKernel3 Flashable ZIP..."
+          zip -r9 $GITHUB_WORKSPACE/OP9Pro-Custom-Kernel-AK3.zip * -x ".*" -x "*.zip"
           
       - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Compiled-Kernel-SM8350
           path: |
+            OP9Pro-Custom-Kernel-AK3.zip
             kernel_workspace/out/arch/arm64/boot/Image
-            kernel_workspace/out/arch/arm64/boot/Image.gz
-            kernel_workspace/out/arch/arm64/boot/dtb
-            kernel_workspace/out/arch/arm64/boot/dts/vendor/qcom/*.dtb
