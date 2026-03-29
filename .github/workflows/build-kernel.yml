@@ -30,13 +30,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev curl git zip unzip cpio gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
 
-      - name: Download Clang Toolchain (r383902b)
+      - name: Download Clang Toolchain (r383902b1)
         run: |
           mkdir -p $GITHUB_WORKSPACE/toolchains/clang
           cd $GITHUB_WORKSPACE/toolchains/clang
-          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r383902b.tar.gz
-          tar -xf clang-r383902b.tar.gz
-          rm clang-r383902b.tar.gz
+          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr2-release/clang-r383902b1.tar.gz
+          tar -xf clang-r383902b1.tar.gz
+          rm clang-r383902b1.tar.gz
 
       - name: Clone OnePlus Kernel Source
         run: |
