@@ -76,8 +76,8 @@ jobs:
         run: |
           export PATH=$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH
           
-          # Fix stupid 8-spaces instead of TAB in OnePlus vendor Makefiles
-          find arch/arm64/boot/dts/vendor/ -name "Makefile" -exec sed -i 's/^        /\t/g' {} +
+          # Fix missing backslash continuation in OnePlus lemonadev Makefile
+          sed -i 's/dtb-$(CONFIG_ARCH_LAHAINA) +=/& \\/' arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile
           
           mkdir -p out
           
