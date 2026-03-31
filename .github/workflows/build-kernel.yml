@@ -109,6 +109,32 @@ jobs:
           # Remove unnecessary scripts, leaving only what is required to flash the Image
           rm -rf modules patch ramdisk dtbs dtb dtbo.img README.md
           
+          # Overwrite the default Galaxy Nexus anykernel.sh with our custom OnePlus 9 Pro script
+          cat << 'EOF' > anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Custom Kernel for OnePlus 9 Pro
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          
+          BLOCK=auto;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          
+          . tools/ak3-core.sh;
+          
+          split_boot;
+          flash_boot;
+          EOF
+          
           echo "Copying compiled Image to AnyKernel3 directory..."
           cp $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4/out/arch/arm64/boot/Image ./Image
           
