@@ -76,8 +76,9 @@ jobs:
         run: |
           export PATH=$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH
           
-          # Fix missing backslash continuation in OnePlus lemonadev Makefile
-          sed -i 's/dtb-$(CONFIG_ARCH_LAHAINA) +=/& \\/' arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile
+          # The stock Makefile references a non-existent lemonadep-overlay.dtb in an else block.
+          # We delete this dead block to prevent "No rule to make target" errors.
+          sed -i '/else/,/endif/d' arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile
           
           mkdir -p out
           
@@ -96,7 +97,8 @@ jobs:
           # Confirm .config is populated exactly as expected
           grep -E "CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG|CONFIG_MODVERSIONS" out/.config
           
-          make $MAKE_ARGS -j$(nproc)
+          # Explicitly build only Image and modules to completely bypass all other broken OnePlus DTB Makefiles
+          make $MAKE_ARGS -j$(nproc) Image modules
           
       - name: Integrate AnyKernel3
         run: |
