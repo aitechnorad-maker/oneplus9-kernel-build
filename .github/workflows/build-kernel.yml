@@ -1,123 +1,1052 @@
-name: Build OnePlus 9 Pro Custom Kernel (SM8350)
+name: Build Stock Kernel & Modules (OnePlus 9 Pro - Android 14)
 
 on:
   workflow_dispatch:
 
 jobs:
   build-kernel:
-    name: Kernel Compilation
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
     steps:
-      - name: Maximize Build Environment Storage
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 8192
-          swap-size-mb: 4096
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
 
-      - name: Checkout Your Repository
-        uses: actions/checkout@v4
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 0 — Free disk space
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Free disk space
+      run: |
+        echo "=== Disk before cleanup ==="
+        df -h /
 
-      - name: Setup Build Environment (Aggressive Cache Cleanup)
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo rm -rf /var/lib/apt/lists/*
-          sudo apt-get clean
-          sudo apt-get update -qq -y
-          sudo apt-get install -y -qq --no-install-recommends \
-            build-essential bc bison flex libssl-dev libelf-dev curl git zip unzip cpio gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+        sudo rm -rf /usr/share/dotnet          # .NET      ~2 GB
+        sudo rm -rf /usr/local/lib/android     # Android   ~8 GB
+        sudo rm -rf /opt/ghc                   # Haskell   ~2 GB
+        sudo rm -rf /usr/local/share/boost     # Boost     ~1 GB
+        sudo rm -rf /opt/hostedtoolcache/CodeQL # CodeQL   ~1 GB
+        sudo rm -rf /usr/share/swift           # Swift     ~2 GB
+        sudo rm -rf /usr/local/go              # Go        ~1 GB
+        sudo rm -rf /usr/lib/jvm               # Java JVM  ~1 GB
+        sudo rm -rf /usr/share/mysql           # MySQL     ~200 MB
+        sudo rm -rf /usr/lib/firefox           # Firefox   ~200 MB
+        sudo rm -rf /usr/lib/chromium-browser  # Chromium  ~200 MB
+        sudo rm -rf /usr/local/share/chromium  # Chromium  ~200 MB
+        sudo apt-get autoremove -y --purge 2>/dev/null || true
+        sudo apt-get clean
+        sudo docker image prune -af 2>/dev/null || true
 
-      - name: Download Clang Toolchain (r383902b1)
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/toolchains/clang
-          cd $GITHUB_WORKSPACE/toolchains/clang
-          wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr2-release/clang-r383902b1.tar.gz
-          tar -xf clang-r383902b1.tar.gz
-          rm clang-r383902b1.tar.gz
+        sudo fallocate -l 20G /swapfile 2>/dev/null || true
+        sudo chmod 600 /swapfile 2>/dev/null || true
+        sudo mkswap /swapfile 2>/dev/null || true
+        sudo swapon /swapfile 2>/dev/null || true
 
-      - name: Clone OnePlus Kernel Source
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4
-          git clone --depth=1 -b oneplus/sm8350_u_14.0.0_oneplus9 https://github.com/OnePlusOSS/android_kernel_oneplus_sm8350.git $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4
-          
-          # Force the exact scmversion to match the stock kernel and prevent + dirty suffix
-          echo "-gd2a1055adeb0" > $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4/.scmversion
+        echo "=== Disk after cleanup ==="
+        df -h /
+        df -h / | awk 'NR==2 {print "Available: "$4}'
 
-      - name: Clone and Integrate Vendor Modules & Devicetree
-        run: |
-          git clone --depth=1 -b oneplus/sm8350_u_14.0.0_oneplus9 https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git vendor_modules
-          
-          mkdir -p $GITHUB_WORKSPACE/android_repo/vendor $GITHUB_WORKSPACE/android_repo/device
-          
-          # Position the vendor and device directories in the native AOSP tree locations
-          cp -a vendor_modules/vendor/* $GITHUB_WORKSPACE/android_repo/vendor/ 2>/dev/null || true
-          cp -a vendor_modules/device/* $GITHUB_WORKSPACE/android_repo/device/ 2>/dev/null || true
-          
-          # Techpack belongs in the kernel source root
-          mkdir -p $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4/techpack
-          cp -a vendor_modules/kernel/msm-5.4/techpack/* $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4/techpack/ 2>/dev/null || true
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 1 — Clone vendor modules and device tree
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Clone vendor modules and device tree
+      run: |
+        git clone \
+          --depth=1 \
+          --branch oneplus/sm8350_u_14.0.0_oneplus9 \
+          https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git \
+          $GITHUB_WORKSPACE/vendor_modules
 
-      - name: Inject Custom Defconfig
-        run: |
-          if [ -f "$GITHUB_WORKSPACE/lahaina-qgki_defconfig" ]; then
-            cp $GITHUB_WORKSPACE/lahaina-qgki_defconfig $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4/arch/arm64/configs/vendor/lahaina-qgki_defconfig
+        echo "=== vendor_modules top-level layout ==="
+        ls $GITHUB_WORKSPACE/vendor_modules/
+
+        echo "=== Techpack dirs confirmed ==="
+        ls $GITHUB_WORKSPACE/vendor_modules/kernel/msm-5.4/techpack/
+
+        echo "=== Oplus kernel subdirs ==="
+        ls $GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel/ 2>/dev/null || echo "(not found)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 2 — Create workspace vendor symlink (AOSP layout)
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Create workspace vendor symlink
+      run: |
+        ln -sfn $GITHUB_WORKSPACE/vendor_modules/vendor $GITHUB_WORKSPACE/vendor
+        echo "vendor/ → $(readlink $GITHUB_WORKSPACE/vendor)"
+        ls $GITHUB_WORKSPACE/vendor/ 2>/dev/null || echo "(empty)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 3 — Clone kernel source
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Clone kernel source
+      run: |
+        git clone \
+          --depth=1 \
+          --branch oneplus/sm8350_u_14.0.0_oneplus9 \
+          https://github.com/onebit-sm/android_kernel_oneplus_sm8350.git \
+          $GITHUB_WORKSPACE/kernel_source
+
+        cd $GITHUB_WORKSPACE/kernel_source
+        echo "Cloned commit: $(git rev-parse --short HEAD)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 3b — Pin kernel version string to match stock OEM build
+    # ══════════════════════════════════════════════════════════════════════════
+    # FIX: .scmversion must be placed IMMEDIATELY after clone, before any
+    # source modifications (Steps 5, 6, 9b, 10 all modify tracked files).
+    # When .scmversion exists, scripts/setlocalversion:
+    #   1. Reads its content directly as the SCM version
+    #   2. SKIPS git rev-parse (no foreign hash from our fork)
+    #   3. SKIPS git diff-index (no -dirty suffix from modifications)
+    #
+    # Stock kernel string: 5.4.254-qgki-gd2a1055adeb0
+    #   5.4.254    → KERNELVERSION from Makefile
+    #   -qgki      → CONFIG_LOCALVERSION in defconfig
+    #   -gd2a1055adeb0 → this is what .scmversion provides
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Pin kernel version string to match stock
+      run: |
+        # Empty .scmversion → setlocalversion returns "" immediately,
+        # suppressing both the git hash AND the dirty-tree +
+        # CONFIG_LOCALVERSION (Step 9) will carry the full suffix.
+        printf '' > $GITHUB_WORKSPACE/kernel_source/.scmversion
+        echo "Pinned .scmversion: (empty — suppresses git dirty marker)"
+        
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 4 — Symlink all techpack directories from vendor_modules
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Symlink all techpack directories from vendor_modules
+      run: |
+        KERNEL=$GITHUB_WORKSPACE/kernel_source
+        TECHPACK_SRC=$GITHUB_WORKSPACE/vendor_modules/kernel/msm-5.4/techpack
+        TECHPACK_DST=$KERNEL/techpack
+
+        if [ ! -d "$TECHPACK_SRC" ]; then
+          echo "FATAL: vendor_modules/kernel/msm-5.4/techpack not found!"
+          ls $GITHUB_WORKSPACE/vendor_modules/
+          exit 1
+        fi
+
+        echo "=== Source techpack contents ==="
+        ls "$TECHPACK_SRC"
+
+        mkdir -p "$TECHPACK_DST"
+
+        LINKED=0
+        FAILED=0
+        for subdir in audio camera video display dataipa; do
+          src="$TECHPACK_SRC/$subdir"
+          dst="$TECHPACK_DST/$subdir"
+
+          if [ -d "$src" ] && [ -f "$src/Makefile" ]; then
+            rm -rf "$dst"
+            ln -sfn "$src" "$dst"
+            echo "  OK: techpack/$subdir → $src"
+            LINKED=$((LINKED + 1))
           else
-            echo "Falling back: downloading lahaina-qgki_defconfig from main..."
-            wget https://raw.githubusercontent.com/aitechnorad-maker/oneplus9-kernel-build/main/lahaina-qgki_defconfig -O $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4/arch/arm64/configs/vendor/lahaina-qgki_defconfig
+            echo "  MISSING: techpack/$subdir not found or has no Makefile at $src"
+            FAILED=$((FAILED + 1))
           fi
+        done
 
-      - name: Build the Kernel
-        working-directory: ${{ github.workspace }}/android_repo/kernel/msm-5.4
-        run: |
-          export PATH=$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH
+        echo ""
+        echo "Linked: $LINKED / 5    Failed: $FAILED"
+
+        if [ "$FAILED" -gt "0" ]; then
+          echo "FATAL: $FAILED techpack dir(s) are missing"
+          exit 1
+        fi
+
+        echo ""
+        echo "=== Makefile reachability check ==="
+        for subdir in audio camera video display dataipa; do
+          if [ -f "$TECHPACK_DST/$subdir/Makefile" ]; then
+            echo "  PASS: techpack/$subdir/Makefile"
+          else
+            echo "  FAIL: techpack/$subdir/Makefile not reachable!"
+            exit 1
+          fi
+        done
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 5 — Fix CRLF line endings
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Fix CRLF line endings in build files
+      run: |
+        strip_crlf() {
+          local tree="$1"
+          local label="$2"
+          local count=0
+
+          while IFS= read -r -d '' f; do
+            sed -i 's/\r//' "$f"
+            count=$((count + 1))
+          done < <(find -L "$tree" -name "Kconfig" -print0 2>/dev/null)
+
+          while IFS= read -r -d '' f; do
+            sed -i 's/\r//' "$f"
+            count=$((count + 1))
+          done < <(find -L "$tree" \( -name "Makefile" -o -name "Kbuild" -o -name "*.mk" \) -print0 2>/dev/null)
+
+          echo "  $label: $count files fixed"
+        }
+
+        echo "Stripping CRLF from kernel_source build files..."
+        strip_crlf "$GITHUB_WORKSPACE/kernel_source" "kernel_source"
+
+        echo "Stripping CRLF from vendor_modules build files..."
+        strip_crlf "$GITHUB_WORKSPACE/vendor_modules" "vendor_modules"
+
+        echo ""
+        echo "=== Verification: lemonadev/Makefile CRLF check ==="
+        LEMON_MK="$GITHUB_WORKSPACE/kernel_source/arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile"
+        if [ -f "$LEMON_MK" ]; then
+          CR_COUNT=$(grep -cP '\r' "$LEMON_MK" || true)
+          echo "  lemonadev/Makefile carriage-return count: $CR_COUNT (must be 0)"
+          [ "$CR_COUNT" -eq 0 ] || { echo "  ERROR: CRLF still present!"; exit 1; }
+          echo "  Lines 12-16 of lemonadev/Makefile:"
+          sed -n '12,16p' "$LEMON_MK" | cat -A
+        else
+          echo "  lemonadev/Makefile not found at expected path (may be elsewhere — OK)"
+        fi
+
+        echo "CRLF fix complete"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 6 — Setup AOSP workspace layout and fix symlinks
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Setup AOSP workspace layout and fix symlinks
+      run: |
+        KERNEL=$GITHUB_WORKSPACE/kernel_source
+        # VENDOR symlink already created in Step 2
+        VENDOR_OPLUS_KERNEL=$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel
+
+        mkdir -p $GITHUB_WORKSPACE/kernel
+        ln -sfn $GITHUB_WORKSPACE/kernel_source $GITHUB_WORKSPACE/kernel/msm-5.4
+
+        mkdir -p $GITHUB_WORKSPACE/vendor_modules/vendor/kernel
+        ln -sfn $GITHUB_WORKSPACE/kernel_source \
+                $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4
+
+        echo "Workspace layout:"
+        ls -la $GITHUB_WORKSPACE/
+        echo "Critical include path check:"
+        ls $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h \
+          && echo "  OK: vendor_modules/vendor/kernel/msm-5.4/mm/internal.h EXISTS" \
+          || echo "  ERROR: mm/internal.h MISSING"
+
+        mkdir -p $KERNEL/drivers/soc/oplus
+        for subdir in boot dfr dft power system cpu; do
+          target="$VENDOR_OPLUS_KERNEL/$subdir"
+          if [ -d "$target" ]; then
+            ln -sfn "$target" "$KERNEL/drivers/soc/oplus/$subdir"
+            echo "  drivers/soc/oplus/$subdir -> $target"
+          fi
+        done
+
+        mkdir -p $KERNEL/include/soc/oplus
+        for subdir in boot dft; do
+          target="$VENDOR_OPLUS_KERNEL/$subdir/include"
+          if [ -d "$target" ]; then
+            ln -sfn "$target" "$KERNEL/include/soc/oplus/$subdir"
+            echo "  include/soc/oplus/$subdir -> $target"
+          fi
+        done
+
+        mkdir -p $KERNEL/kernel
+        for subdir in sched_assist oplus_performance; do
+          target=$(find $VENDOR_OPLUS_KERNEL -maxdepth 4 -type d -name "$subdir" 2>/dev/null | head -1)
+          if [ -n "$target" ]; then
+            ln -sfn "$target" "$KERNEL/kernel/$subdir"
+            echo "  kernel/$subdir -> $target"
+          fi
+        done
+
+        # ── FIX: inject lemonadev into the correct oplus DTS Makefile ──
+        echo "=== Fixing lemonadev DTB inclusion ==="
+
+        OPLUS_DTS_DIR=""
+        for candidate in \
+          "$GITHUB_WORKSPACE/vendor_modules/kernel/msm-5.4/arch/arm64/boot/dts/vendor/oplus" \
+          "$GITHUB_WORKSPACE/vendor_modules/vendor/qcom/proprietary/devicetree/oplus" \
+          "$KERNEL/arch/arm64/boot/dts/vendor/oplus"
+        do
+          if [ -d "$candidate" ]; then
+            OPLUS_DTS_DIR="$candidate"
+            echo "  Found oplus DTS dir at: $OPLUS_DTS_DIR"
+            break
+          fi
+        done
+
+        if [ -z "$OPLUS_DTS_DIR" ]; then
+          echo "  Known paths not found — running broad search for lemonadev/..."
+          LEMON_DIR=$(find -L $GITHUB_WORKSPACE/vendor_modules -type d -name "lemonadev" 2>/dev/null | head -1)
+          if [ -n "$LEMON_DIR" ]; then
+            OPLUS_DTS_DIR=$(dirname "$LEMON_DIR")
+            echo "  Found via broad search — oplus DTS dir: $OPLUS_DTS_DIR"
+          fi
+        fi
+
+        if [ -z "$OPLUS_DTS_DIR" ]; then
+          echo "FATAL: Cannot locate the oplus DTS directory containing lemonadev/"
+          echo "Searched inside vendor_modules:"
+          find $GITHUB_WORKSPACE/vendor_modules -maxdepth 8 -type d -name "oplus" 2>/dev/null | head -10 || true
+          exit 1
+        fi
+
+        OPLUS_MK="$OPLUS_DTS_DIR/Makefile"
+
+        if [ -f "$OPLUS_MK" ]; then
+          if ! grep -q "lemonadev" "$OPLUS_MK"; then
+            echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
+            echo "  Injected lemonadev into $OPLUS_MK"
+          else
+            echo "  lemonadev already present in $OPLUS_MK (no change needed)"
+          fi
+        else
+          echo 'subdir-y += lemonadev' > "$OPLUS_MK"
+          echo "  Created $OPLUS_MK with lemonadev"
+        fi
+
+        if [ ! -d "$OPLUS_DTS_DIR/lemonadev" ]; then
+          echo "FATAL: $OPLUS_DTS_DIR/lemonadev/ directory not found!"
+          exit 1
+        fi
+        if [ ! -f "$OPLUS_DTS_DIR/lemonadev/Makefile" ]; then
+          echo "FATAL: $OPLUS_DTS_DIR/lemonadev/Makefile not found!"
+          exit 1
+        fi
+        echo "  lemonadev/ directory and Makefile confirmed reachable"
+        echo "  Final oplus/Makefile contents:"
+        cat "$OPLUS_MK"
+        echo
+
+        echo ""
+        echo "=== Generic symlink repair scan ==="
+        FIXED=0
+        UNFIXED=0
+        while IFS= read -r link; do
+          [ -e "$link" ] && continue
+          raw_target=$(readlink "$link")
+          clean=$(echo "$raw_target" | sed 's|^\(\.\./\)*||')
+          for candidate in \
+            "$GITHUB_WORKSPACE/vendor_modules/$clean" \
+            "$GITHUB_WORKSPACE/vendor_modules/vendor/$(echo "$clean" | sed 's|^vendor/||')" \
+            "$(find $GITHUB_WORKSPACE/vendor_modules -type d -name "$(basename "$raw_target")" 2>/dev/null | head -1)"
+          do
+            if [ -n "$candidate" ] && [ -e "$candidate" ]; then
+              ln -sfn "$candidate" "$link"
+              FIXED=$((FIXED + 1))
+              break
+            fi
+          done
+          [ -e "$link" ] || UNFIXED=$((UNFIXED + 1))
+        done < <(find "$KERNEL" -type l)
+        echo "  Additional fixed: $FIXED  |  Still unfixed: $UNFIXED"
+
+        echo ""
+        echo "=== Critical path checks ==="
+        ALL_OK=1
+        for check in \
+          "kernel/sched_assist" \
+          "drivers/soc/oplus/system" \
+          "techpack/audio" \
+          "techpack/camera" \
+          "techpack/video" \
+          "techpack/display" \
+          "techpack/dataipa"
+        do
+          path="$KERNEL/$check"
+          if [ -L "$path" ] && [ ! -e "$path" ]; then
+            echo "  FATAL: $check is still broken!"
+            ALL_OK=0
+          elif [ -e "$path" ]; then
+            echo "  OK: $check"
+          else
+            echo "  WARN: $check does not exist (may be optional)"
+          fi
+        done
+        [ "$ALL_OK" = "1" ] || exit 1
+        
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 7 — Install build dependencies
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y \
+          bc \
+          bison \
+          build-essential \
+          ccache \
+          curl \
+          flex \
+          git \
+          kmod \
+          libelf-dev \
+          libssl-dev \
+          lz4 \
+          make \
+          python3 \
+          unzip \
+          zip \
+          zlib1g-dev \
+          binutils-aarch64-linux-gnu
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 8 — Download Clang r383902b1
+    # ══════════════════════════════════════════════════════════════════════════
+    # NOTE: r383902b1 IS the correct Clang for this kernel. The stock OEM
+    # kernel was built with the same Clang version:
+    #   "Android (6877366 based on r383902b1) clang version 11.0.2"
+    # Using a newer Clang (e.g. r450784e) would cause ABI incompatibilities.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Download Clang r383902b1
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/toolchain/clang
+
+        TARBALL_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr2-release/clang-r383902b1.tar.gz"
+
+        echo "Downloading Clang r383902b1..."
+        curl -fL --retry 3 --retry-delay 10 --max-time 600 \
+          "$TARBALL_URL" \
+          -o /tmp/clang.tar.gz \
+          && CLANG_OK=1 || CLANG_OK=0
+
+        if [ "$CLANG_OK" = "1" ]; then
+          echo "Extracting..."
+          tar -xf /tmp/clang.tar.gz -C $GITHUB_WORKSPACE/toolchain/clang
+        else
+          echo "Primary URL failed — using git sparse-checkout fallback..."
+          git clone \
+            --filter=blob:none \
+            --no-checkout \
+            --depth=1 \
+            https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86.git \
+            $GITHUB_WORKSPACE/toolchain/clang_repo
+          cd $GITHUB_WORKSPACE/toolchain/clang_repo
+          git sparse-checkout init --cone
+          git sparse-checkout set clang-r383902b1
+          git checkout HEAD
+          cp -r $GITHUB_WORKSPACE/toolchain/clang_repo/clang-r383902b1/. \
+                $GITHUB_WORKSPACE/toolchain/clang/
+        fi
+
+        if [ ! -f "$GITHUB_WORKSPACE/toolchain/clang/bin/clang" ]; then
+          echo "ERROR: bin/clang not found!"
+          find $GITHUB_WORKSPACE/toolchain/clang -maxdepth 3 | head -30
+          exit 1
+        fi
+
+        $GITHUB_WORKSPACE/toolchain/clang/bin/clang --version
+        echo "CLANG_BIN_DIR=$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_ENV
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 9 — Generate .config from defconfig
+    # ══════════════════════════════════════════════════════════════════════════
+    # FIX APPLIED:
+    #   - Removed .scmversion from here (moved to Step 3b)
+    #   - Added --disable LOCALVERSION_AUTO (belt-and-suspenders with .scmversion)
+    #   - Added --disable MODVERSIONS (CRITICAL: stock commit d2a1055adeb0 is
+    #     gone from all public repos, so symbol CRCs will inevitably differ.
+    #     Disabling MODVERSIONS bypasses CRC checks entirely.)
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Generate .config from defconfig
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        
+        make O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          vendor/lahaina-qgki_defconfig
+
+        scripts/config --file out/.config \
+          --set-str LOCALVERSION "-qgki-gd2a1055adeb0" \
+          --disable LOCALVERSION_AUTO \
+          --disable MODVERSIONS \
+          --disable MODULE_SIG_FORCE \
+          --disable MODULE_SIG_ALL \
+          --enable QCOM_COMMAND_DB \
+          --enable DRM_OPLUS_NOTIFY \
+          --enable DRM_OPLUS_PANEL_NOTIFY \
+          --enable OPLUS_BINDER_STATS_ENABLE \
+          --enable BUILD_ARM64_DT_OVERLAY
+
+        # Apply the changes
+        make O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          olddefconfig
+
+        # Verify critical config values
+        echo "=== Config verification ==="
+        grep -E "LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|DRM_OPLUS|QCOM_COMMAND_DB|OPLUS_BINDER" out/.config || true
+        grep "CONFIG_LOCALVERSION" out/.config
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 9b — Inject display-notifier stubs for vmlinux linkage
+    # ══════════════════════════════════════════════════════════════════════════
+    # These are __weak stubs — if CONFIG_DRM_OPLUS_NOTIFY=y compiles the real
+    # implementations, the linker uses those instead. If not, these stubs
+    # provide the symbols so vmlinux links and msm_drm.ko can load.
+    #
+    # IMPORTANT: Uses EXPORT_SYMBOL (not EXPORT_SYMBOL_GPL) because the
+    # stock vendor modules (msm_drm.ko, uff_fp_driver.ko) are non-GPL.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Inject display-notifier stubs for vmlinux linkage
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        STUB_DIR="drivers/oplus_display_stubs"
+        mkdir -p "$STUB_DIR"
+
+        printf '%s\n' \
+          '// SPDX-License-Identifier: GPL-2.0-only' \
+          '// Weak stub implementations for msm_drm / lcdinfo notifier symbols.' \
+          '// EXPORT_SYMBOL is required here because non-GPL loadable modules' \
+          '// reference these at load time.' \
+          '' \
+          '#include <linux/module.h>' \
+          '#include <linux/notifier.h>' \
+          '' \
+          'int __weak msm_drm_register_client(struct notifier_block *nb)' \
+          '{' \
+          '	return 0;' \
+          '}' \
+          'EXPORT_SYMBOL(msm_drm_register_client);' \
+          '' \
+          'int __weak msm_drm_unregister_client(struct notifier_block *nb)' \
+          '{' \
+          '	return 0;' \
+          '}' \
+          'EXPORT_SYMBOL(msm_drm_unregister_client);' \
+          '' \
+          'int __weak register_lcdinfo_notifier(struct notifier_block *nb)' \
+          '{' \
+          '	return 0;' \
+          '}' \
+          'EXPORT_SYMBOL(register_lcdinfo_notifier);' \
+          '' \
+          'int __weak unregister_lcdinfo_notifier(struct notifier_block *nb)' \
+          '{' \
+          '	return 0;' \
+          '}' \
+          'EXPORT_SYMBOL(unregister_lcdinfo_notifier);' \
+          > "$STUB_DIR/display_notifier_stubs.c"
+
+        printf '%s\n' \
+          'obj-y += display_notifier_stubs.o' \
+          > "$STUB_DIR/Makefile"
+
+        if ! grep -q "oplus_display_stubs" drivers/Makefile; then
+          echo 'obj-y += oplus_display_stubs/' >> drivers/Makefile
+          echo "Appended oplus_display_stubs/ to drivers/Makefile"
+        else
+          echo "oplus_display_stubs/ already present in drivers/Makefile"
+        fi
+
+        echo "=== Stub file contents ==="
+        cat "$STUB_DIR/display_notifier_stubs.c"
+        echo ""
+        echo "=== Stub Makefile ==="
+        cat "$STUB_DIR/Makefile"
+        echo ""
+        echo "=== drivers/Makefile tail (verify hook) ==="
+        tail -5 drivers/Makefile
+    
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 9c — Fix fingerprint driver include path
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Fix fingerprint driver include path
+      run: |
+        for search_root in \
+          "$GITHUB_WORKSPACE/kernel_source/drivers/input" \
+          "$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/secure"
+        do
+          FP_FILE=$(find -L "$search_root" -name "fp_driver.c" 2>/dev/null | head -1)
+          if [ -n "$FP_FILE" ]; then
+            echo "Found fp_driver.c at: $FP_FILE"
+            # Fix the include — change double-quote to angle-bracket form
+            sed -i \
+              's|#include "touchpanel_event_notify\.h"|#include <soc/oplus/touchpanel_event_notify.h>|g' \
+              "$FP_FILE"
+            echo "Fixed include in: $FP_FILE"
+            echo "=== Verify fix (line 88-92) ==="
+            sed -n '88,92p' "$FP_FILE"
+            break
+          fi
+        done
+
+        if [ -z "$FP_FILE" ]; then
+          echo "WARNING: fp_driver.c not found — fingerprint driver may not be compiled"
+        fi
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Fix vendor DTB Makefile indentation
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        # Find lemonadev/Makefile through BOTH real and symlink paths
+        LEMON_REAL=$(find -L \
+          "$GITHUB_WORKSPACE/vendor_modules" \
+          "$GITHUB_WORKSPACE/kernel_source" \
+          -path "*/lemonadev/Makefile" 2>/dev/null | head -1)
+
+        if [ -n "$LEMON_REAL" ]; then
+          echo "Found: $LEMON_REAL"
+
+          # Strip \r (CRLF)
+          sed -i 's/\r//' "$LEMON_REAL"
+
+          # FIX: convert leading spaces to tabs on recipe lines.
+          sed -i 's/^        /\t/' "$LEMON_REAL"
+          sed -i '/^\t/! s/^    /\t/' "$LEMON_REAL"
+
+          # FIX: The Makefile relies on CONFIG_BUILD_ARM64_DT_OVERLAY=y to build dtbo overlays.
+          # If not set, it tries to build a monolithic lemonadep-overlay.dtb which doesn't exist.
+          # We force the Makefile to ALWAYS build the dtbos and strip the ifeq/else.
           
-          # The stock Makefile references a non-existent lemonadep-overlay.dtb in an else block.
-          # We delete this dead block to prevent "No rule to make target" errors.
-          sed -i '/else/,/endif/d' arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile
+          # Delete the ifeq, else, and endif lines
+          sed -i '/ifeq ($(CONFIG_BUILD_ARM64_DT_OVERLAY),y)/d' "$LEMON_REAL"
+          sed -i '/^else/d' "$LEMON_REAL"
+          sed -i '/^endif/d' "$LEMON_REAL"
           
-          mkdir -p out
+          # Delete the monolithic target that doesn't exist
+          sed -i '/lemonadep-overlay.dtb/d' "$LEMON_REAL"
           
-          # Disable LOCALVERSION_AUTO to prevent unexpected tag additions to the kernel release string
-          sed -i 's/CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' arch/arm64/configs/vendor/lahaina-qgki_defconfig
-          
-          MAKE_ARGS="O=out ARCH=arm64 SUBARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabihf- LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1"
-          
-          make $MAKE_ARGS -j$(nproc) vendor/lahaina-qgki_defconfig
-          
-          # Force disable signature verification and module versions directly in the generated .config
-          scripts/config --file out/.config --disable MODULE_SIG_FORCE
-          scripts/config --file out/.config --disable MODULE_SIG_ALL
-          scripts/config --file out/.config --disable MODVERSIONS
-          
-          # Confirm .config is populated exactly as expected
-          grep -E "CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG|CONFIG_MODVERSIONS" out/.config
-          
-          # Explicitly build only Image and modules to completely bypass all other broken OnePlus DTB Makefiles
-          make $MAKE_ARGS -j$(nproc) Image modules
-          
-      - name: Integrate AnyKernel3
-        run: |
-          echo "Cloning AnyKernel3..."
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git $GITHUB_WORKSPACE/AnyKernel3
-          cd $GITHUB_WORKSPACE/AnyKernel3
-          
-          # Remove unnecessary scripts, leaving only what is required to flash the Image
-          rm -rf modules patch ramdisk dtbs dtb dtbo.img README.md
-          
-          echo "Copying compiled Image to AnyKernel3 directory..."
-          cp $GITHUB_WORKSPACE/android_repo/kernel/msm-5.4/out/arch/arm64/boot/Image ./Image
-          
-          echo "Creating AnyKernel3 Flashable ZIP (Image only)..."
-          zip -r9 $GITHUB_WORKSPACE/OP9Pro-Custom-Kernel-AK3.zip * -x ".*" -x "*.zip"
-          
-      - name: Upload Kernel Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: Compiled-Kernel-SM8350
-          path: |
-            OP9Pro-Custom-Kernel-AK3.zip
+          # Ensure dtbo-y is used (some Makefiles use dtbo-$(CONFIG_ARCH_LAHAINA))
+          sed -i 's/dtbo-\$(CONFIG_ARCH_LAHAINA) +=/dtbo-y += \\/' "$LEMON_REAL"
+
+          echo "=== Lines 1-20 after fix ==="
+          head -20 "$LEMON_REAL" | cat -A
+          echo "=== Full Makefile (%% debug) ==="
+          cat -An "$LEMON_REAL"
+
+          CR_LEFT=$(grep -cP '\r' "$LEMON_REAL" || echo 0)
+          echo "Carriage returns remaining: $CR_LEFT (must be 0)"
+          echo "  Makefile patched OK"
+
+        else
+          echo "FATAL: lemonadev/Makefile not found anywhere!"
+          exit 1
+        fi
+
+        # Scan all vendor DTS Makefiles through symlinks — strip CRLF from all
+        DTS_VENDOR="arch/arm64/boot/dts/vendor"
+        [ -d "$DTS_VENDOR" ] || { echo "dts/vendor not present yet — skipping bulk scan"; exit 0; }
+        find -L "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) \
+          | while read -r mkfile; do
+          sed -i 's/\r//' "$mkfile" 2>/dev/null || true
+        done
+        echo "Makefile CRLF fix complete"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 10b — Commit automated fixes to prevent dirty tree module suffix (+)
+    # ══════════════════════════════════════════════════════════════════════════
+    # The kernel script scripts/setlocalversion unconditionally appends a "+" 
+    # to the kernel version if the git tree is dirty (modified tracked files).
+    # Since we modified Kconfig, Makefile, stubs, and CRLFs, the tree is dirty.
+    # Committing these changes ensures the version string exactly matches 
+    # 5.4.254-qgki-gd2a1055adeb0 without the trailing +.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Commit automated fixes to prevent dirty tree output
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add -A
+        git commit -m "Automated build fixes: CRLF, Display Stubs, Makefiles" || true
+        
+        echo "Git working directory status:"
+        git status -s
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 11 — Build kernel Image
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build kernel Image
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          Image > $GITHUB_WORKSPACE/build.log 2>&1
+        tail -20 $GITHUB_WORKSPACE/build.log || true
+
+        if [ ! -f out/arch/arm64/boot/Image ]; then
+          echo ""
+          echo "══════════ BUILD FAILED ══════════"
+          echo "--- Linker / compiler errors ---"
+          grep -E "ld\.lld: error:|fatal error:|error:|No such file or directory|Stop\." \
+            $GITHUB_WORKSPACE/build.log | grep -v "^--$" | tail -60 || true
+          echo ""
+          echo "--- Last 60 lines of build.log ---"
+          tail -60 $GITHUB_WORKSPACE/build.log
+          exit 1
+        fi
+        echo "=== Kernel Image built ==="
+        du -h out/arch/arm64/boot/Image
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 11b — Verify kernel version string matches stock
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Verify kernel version matches stock
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        # kernel.release is the authoritative source — never use strings()
+        # on the Image binary; it finds printf format strings first.
+        RELEASE=$(cat out/include/config/kernel.release 2>/dev/null || echo "NOT FOUND")
+        echo "kernel.release: $RELEASE"
+    
+        if echo "$RELEASE" | grep -qF "5.4.254-qgki-gd2a1055adeb0"; then
+          echo "✓ Version string matches stock — vermagic will match"
+        else
+          echo "⚠ WARNING: Version string does NOT match stock exactly"
+          echo "  Expected: 5.4.254-qgki-gd2a1055adeb0"
+          echo "  Got:      $RELEASE"
+          echo "  Check: CONFIG_LOCALVERSION in out/.config"
+          grep "CONFIG_LOCALVERSION" out/.config || true
+          exit 1   # fail hard — a wrong vermagic will always bootloop
+        fi
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 12 — Build DTBs
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build DTBs
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        # Suppress non-fatal DTC warnings from upstream yupik DTSI files.
+        export DTC_FLAGS="-Wno-gpios_property -Wno-graph_port -Wno-unit_address_vs_reg -Wno-pci_device_reg -Wno-pci_device_bus_num -Wno-simple_bus_reg -Wno-unique_unit_address -Wno-avoid_unnecessary_addr_size -Wno-graph_child_address -Wno-unit_address_format"
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          DTC_FLAGS="$DTC_FLAGS" \
+          dtbs 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
+
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          echo "WARNING: DTB build had errors — checking if lemonade DTBs were built..."
+        fi
+
+        echo ""
+        echo "=== Lemonade DTB check ==="
+        LEMON_COUNT=$(find out/arch/arm64/boot/dts -name "*lemonad*.dtb*" 2>/dev/null | wc -l)
+        if [ "$LEMON_COUNT" -eq "0" ]; then
+          echo "FATAL: No lemonade DTBs were built!"
+          exit 1
+        fi
+        find out/arch/arm64/boot/dts -name "*lemonad*.dtb*" | while read f; do echo "  FOUND: $f"; done
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 13 — Build in-tree kernel modules
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build in-tree kernel modules
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          modules 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
+        
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+          echo "FATAL: in-tree modules build failed!"
+          exit 1
+        fi
+        echo "In-tree modules built OK"
+
+        echo "In-tree .ko count: $(find out -name '*.ko' | wc -l)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 14 — Build out-of-tree vendor modules
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build vendor modules
+      continue-on-error: true
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        BUILT=0
+        SKIPPED=0
+        while IFS= read -r mod_dir; do
+          mod_dir=$(dirname "$mod_dir")
+          echo "$mod_dir" | grep -qE "devicetree|dts" && { SKIPPED=$((SKIPPED + 1)); continue; }
+          echo "Building: $mod_dir"
+          make -j2 \
+            -C $GITHUB_WORKSPACE/kernel_source \
+            O=out \
+            M="$mod_dir" \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            modules 2>&1 || { echo "WARNING: failed to compile $mod_dir (non-fatal)"; }
+          BUILT=$((BUILT + 1))
+        done < <(find $GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel \
+          -maxdepth 4 \( -name "Kbuild" -o -name "Makefile" \) -print 2>/dev/null)
+        echo "Vendor module dirs attempted: $BUILT  skipped: $SKIPPED"
+        echo "Vendor .ko count: $(find $GITHUB_WORKSPACE/vendor_modules -name '*.ko' 2>/dev/null | wc -l)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 15 — Collect DTB blobs
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Collect DTB/DTBO blobs
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/dtbs
+        find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
+          \( -name "*.dtb" -o -name "*.dtbo" \) \
+          -exec cp {} $GITHUB_WORKSPACE/dtbs/ \; 2>/dev/null || true
+
+        echo "Total DTBs/DTBOs collected: $(ls $GITHUB_WORKSPACE/dtbs/ 2>/dev/null | wc -l)"
+
+        echo "=== Lemonade DTBs/DTBOs ==="
+        ls $GITHUB_WORKSPACE/dtbs/*lemonad* 2>/dev/null || echo "(none found)"
+
+        echo "=== Lahaina base DTBs ==="
+        ls $GITHUB_WORKSPACE/dtbs/lahaina*.dtb 2>/dev/null || echo "(none found)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 16 — Prepare AnyKernel3
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Prepare AnyKernel3
+      run: |
+        git clone --depth=1 \
+          https://github.com/osm0sis/AnyKernel3.git \
+          $GITHUB_WORKSPACE/anykernel
+
+        rm -f $GITHUB_WORKSPACE/anykernel/Image \
+              $GITHUB_WORKSPACE/anykernel/zImage \
+              $GITHUB_WORKSPACE/anykernel/Image.gz \
+              $GITHUB_WORKSPACE/anykernel/Image.gz-dtb \
+              $GITHUB_WORKSPACE/anykernel/dtb \
+              $GITHUB_WORKSPACE/anykernel/dtbo.img
+
+        (
+          echo '#!/bin/sh'
+          echo '# AnyKernel3 - OnePlus 9 Pro (lemonadep) | Android 14'
+          echo ''
+          echo 'properties() {'
+          echo 'kernel.string="Stock Base Kernel - OnePlus 9 Pro (Android 14)"'
+          echo 'do.devicecheck=1'
+          echo 'do.modules=0'
+          echo 'do.systemless=1'
+          echo 'do.cleanup=1'
+          echo 'do.cleanuponabort=0'
+          echo 'device.name1=lemonadep'
+          echo 'device.name2=lemonade'
+          echo 'device.name3=OnePlus9Pro'
+          echo 'device.name4='
+          echo 'device.name5='
+          echo 'supported.versions=14'
+          echo '}'
+          echo ''
+          echo 'block=boot'
+          echo 'is_slot_device=1'
+          echo 'ramdisk_compression=auto'
+          echo 'patch_vbmeta_flag=auto'
+          echo ''
+          echo '. tools/ak3-core.sh'
+          echo ''
+          echo 'dump_boot'
+          echo 'write_boot'
+        ) > $GITHUB_WORKSPACE/anykernel/anykernel.sh
+
+        echo "=== anykernel.sh ==="
+        cat $GITHUB_WORKSPACE/anykernel/anykernel.sh
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 17 — Assemble flashable package
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Assemble flashable package
+      run: |
+        AK=$GITHUB_WORKSPACE/anykernel
+
+        # Kernel Image
+        cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image $AK/
+        echo "Kernel Image: OK"
+        
+        # Package DTB and DTBO into AnyKernel3
+        echo "=== Selecting correct base DTB for OnePlus 9 Pro (Lahaina) ==="
+        DTB_SRC=""
+        for candidate in "lahaina-v2.1.dtb" "lahaina-v2.dtb" "lahaina.dtb"; do
+          f="$GITHUB_WORKSPACE/dtbs/$candidate"
+          if [ -f "$f" ]; then
+            DTB_SRC="$f"
+            break
+          fi
+        done
+
+        # Strict fallback: search for ANY lahaina*.dtb, avoid yupik/etc.
+        if [ -z "$DTB_SRC" ]; then
+          DTB_SRC=$(find "$GITHUB_WORKSPACE/dtbs" -name "lahaina*.dtb" | sort | head -n 1)
+        fi
+
+        if [ -n "$DTB_SRC" ] && [ -f "$DTB_SRC" ]; then
+          cp "$DTB_SRC" $AK/dtb
+          echo "✓ DTB packaged: $(basename "$DTB_SRC")"
+        else
+          echo "ERROR: No suitable Lahaina DTB found. Available DTBs:"
+          ls $GITHUB_WORKSPACE/dtbs/ | head -n 20
+          exit 1
+        fi
+
+        # Assemble dtbo.img from all lemonade* overlays (cat is fine for QCOM)
+        echo "=== Assembling dtbo.img from lemonade overlays ==="
+        DTBO_FILES=$(find "$GITHUB_WORKSPACE/dtbs" -name "lemonade*.dtbo" | sort)
+        if [ -n "$DTBO_FILES" ]; then
+          cat $DTBO_FILES > $AK/dtbo.img
+          echo "✓ DTBO packaged: $(ls -lh $AK/dtbo.img | awk '{print $5}')"
+        else
+          echo "WARNING: No lemonade DTBO overlays found!"
+        fi
+
+        # NOTE: do.modules=0 in anykernel.sh — no vendor partition modules
+        # are packaged. The vendor_boot ramdisk modules are handled
+        # separately in Step 17a below.
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 17a — Rebuild vendor_boot ramdisk with custom-built modules
+    # ══════════════════════════════════════════════════════════════════════════
+    # The stock vendor_boot.img is hosted in smualemi/op9pro-kernel-build repo.
+    # This step downloads it, unpacks, replaces ramdisk modules with our
+    # custom-built ones, and repacks into vendor_boot_custom.img.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Rebuild vendor_boot with custom ramdisk modules
+      run: |
+        WORK_DIR=$GITHUB_WORKSPACE/vendor_boot_work
+        mkdir -p $WORK_DIR
+        cd $WORK_DIR
+
+        # ── 1. Locate and extract stock vendor_boot.img ────────────
+        echo "Searching for stock_vendor_boot.zip in workspace..."
+        VBOOT_ZIP=$(find $GITHUB_WORKSPACE -name "vendor_boot.zip" | head -n 1)
+        if [ -z "$VBOOT_ZIP" ]; then
+          echo "FATAL: vendor_boot.zip not found in workspace!"
+          find $GITHUB_WORKSPACE -maxdepth 3
+          exit 1
+        fi
+        echo "Found: $VBOOT_ZIP"
+        cp "$VBOOT_ZIP" stock_vendor_boot.zip
+        
+        unzip -o stock_vendor_boot.zip
+        STOCK_IMG=$(find . -name "*.img" | head -n 1)
+        if [ -z "$STOCK_IMG" ]; then
+          echo "ERROR: No .img found in stock_vendor_boot.zip!"
+          exit 1
+        fi
+        if [ "$STOCK_IMG" != "./vendor_boot.img" ] && [ "$STOCK_IMG" != "vendor_boot.img" ]; then
+          mv "$STOCK_IMG" vendor_boot.img
+        fi
+        echo "Stock image: vendor_boot.img ($(du -h vendor_boot.img | cut -f1))"
+
+        # ── 2. Get Magisk v27.0 (Known Working) ────────────────────
+        echo "==> Fetching official magiskboot (v27.0) from Magisk APK..."
+        wget -qO magisk.apk https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk
+        unzip -j magisk.apk "lib/x86_64/libmagiskboot.so" -d .
+        mv libmagiskboot.so magiskboot
+        chmod +x magiskboot
+
+        # ── 3. Unpack and extract ramdisk ─────────────────────────
+        echo "==> Unpacking vendor_boot.img..."
+        ./magiskboot unpack vendor_boot.img
+        RAMDISK_CPIO=$(find . -maxdepth 1 -name "*ramdisk.cpio" | head -1)
+        mkdir ramdisk_ext && cd ramdisk_ext
+        cpio -idm < ../$RAMDISK_CPIO
+        
+        # ── 4. Replace stock .ko modules with newly built ones ─────
+        echo "==> Replacing stock .ko modules..."
+        # Search BOTH in-tree and out-of-tree (vendor_modules) outputs
+        PLACED=0
+        for ko in $(find "$GITHUB_WORKSPACE/kernel_source/out" "$GITHUB_WORKSPACE/vendor_modules" -name "*.ko" -type f 2>/dev/null); do
+            filename=$(basename $ko)
+            target=$(find . -type f -name "$filename" | head -n 1)
+            if [ -n "$target" ]; then
+                cp "$ko" "$target"
+                echo "  [Updated] $filename -> $target"
+                PLACED=$((PLACED + 1))
+            fi
+        done
+        echo "Replaced $PLACED modules."
+        
+        # ── 5. Repack cpio and update internal DTB ────────────────
+        find . | cpio -H newc -o > ../$RAMDISK_CPIO
+        cd ..
+        
+        echo "==> Updating internal vendor_boot DTB..."
+        VBOOT_DTB=""
+        for candidate in "lahaina-v2.1.dtb" "lahaina-v2.dtb" "lahaina.dtb"; do
+          f="$GITHUB_WORKSPACE/dtbs/$candidate"
+          if [ -f "$f" ]; then VBOOT_DTB="$f"; break; fi
+        done
+        if [ -n "$VBOOT_DTB" ]; then
+          cp "$VBOOT_DTB" dtb
+          echo "✓ Internal DTB updated: $(basename "$VBOOT_DTB")"
+        fi
+
+        # ── 6. Final Repack and cleanup ───────────────────────────
+        echo "==> Repacking vendor_boot_custom.img..."
+        ./magiskboot repack vendor_boot.img vendor_boot_custom.img
+        cp vendor_boot_custom.img $GITHUB_WORKSPACE/vendor_boot_custom.img
+        echo "Final artifact ready: $GITHUB_WORKSPACE/vendor_boot_custom.img"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 17b — Upload vendor_boot artifact
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Upload custom vendor_boot
+      uses: actions/upload-artifact@v4
+      with:
+        name: vendor-boot-custom
+        path: ${{ github.workspace }}/vendor_boot_custom.img
+        retention-days: 30
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 18 — Create flashable ZIP
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Create flashable ZIP
+      run: |
+        ZIP_NAME="Stock-Base-OP9Pro-$(date +%Y%m%d-%H%M).zip"
+        cd $GITHUB_WORKSPACE/anykernel
+        zip -r9 $GITHUB_WORKSPACE/$ZIP_NAME . \
+          --exclude=".git/*" \
+          --exclude="README.md" \
+          --exclude="*placeholder"
+        echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+        du -h $GITHUB_WORKSPACE/$ZIP_NAME
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 19 — Upload artifacts
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Upload flashable kernel ZIP
+      uses: actions/upload-artifact@v4
+      with:
+        name: Stock-Base-Kernel-OP9Pro
+        path: ${{ github.workspace }}/${{ env.ZIP_NAME }}
+        retention-days: 30
+
+    - name: Upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: ${{ github.workspace }}/build.log
+        retention-days: 7
